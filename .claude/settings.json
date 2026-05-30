@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(.\\send-cli *)",
+      "PowerShell(.\\ParseRTL *)",
+      "PowerShell(Get-Content qrun.log)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Start-Process -FilePath qverify *)",
+      "PowerShell(New-Item -ItemType Directory -Force *)",
+      "PowerShell(Get-Command qverify *)"
+    ]
+  }
+}

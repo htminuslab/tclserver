@@ -1,171 +1,255 @@
 ---
 name: lint
-description: Run Questa Lint on the current VHDL/Verilog/SystemVerilog project via the send-cli bridge to the Tcl CLI server. Use whenever the user asks to lint code, run questa lint, check HDL for lint issues, run lint with a specific methodology (fpga/ip/soc/do-254/iso26262) or goal (start/simulation/implementation/release), generate a lint report, or correct/fix sources based on a previous lint report at output_lint/lint.rpt.
+description: Run Questa Lint on the current VHDL/Verilog/SystemVerilog project via the send-cli bridge to the Tcl CLI server. Use whenever the user asks to lint code, run questa lint, check HDL for lint issues, run lint with a specific methodology (fpga/ip/soc/do-254/iso26262) or goal (start/simulation/implementation/release), generate a lint report, or correct/fix sources based on a previous lint report.
 ---
 
 # Questa Lint orchestration skill
 
-This skill drives Questa Lint through the `send-cli` bridge so the user does not have to hand-author a Tcl script. Every command goes over the socket as a single Tcl string; the server replies with one JSON object per call: `{"status":"ok","result":"..."}`, `{"status":"online"}`, or `{"status":"error","message":"..."}`.
+This skill drives Questa Lint through the `send-cli` bridge so the user never has to hand-author a Tcl script. Every command is sent over the socket as a **single Tcl string** to `send-cli`; the server replies with **one JSON object per call**, one of:
 
-Run the phases below in order. Stop on the first hard failure and surface a clear remediation.
+- `{"status":"ok","result":"..."}`
+- `{"status":"online"}`
+- `{"status":"error","message":"..."}`
 
-## Phase 0 — Parse the request
+`send-cli` is invoked either as `send-cli` (on PATH) or as `.\send-cli`. Parse **every** reply with `ConvertFrom-Json` and branch on `.status` — never string-match raw output. Accept both `ok` and `online` as success.
 
-From the user message (and `$ARGUMENTS` if invoked via `/lint <args>`), extract:
-
-- **output_dir** — token after "output", "out", or `--out=`. Default `./output_lint`.
-- **methodology** — one of `fpga|ip|soc|do-254|iso26262`. Default `fpga`.
-- **goal** — one of `start|simulation|implementation|release`. Default `release`.
-- **explicit_sources** — any source filenames the user names directly (e.g. "please lint div.vhd" → `div.vhd`). These short-circuit Phase 3 discovery.
-- **top** — top-level entity (VHDL) or module (Verilog). If the user named exactly one explicit source, derive `top` by reading the file (the `entity <name> is` for VHDL, or `module <name>` for Verilog/SV) — do **not** guess from the filename stem. Otherwise, if not given, **ASK the user**.
-
-Echo the resolved configuration as a short bullet list before doing anything else.
-
-## Phase 1 — Status check (auto-start if needed)
-
-Run:
-
-```powershell
-$resp = send-cli status
-$j = $resp | ConvertFrom-Json
-```
-
-Accept `$j.status -eq 'ok'` or `$j.status -eq 'online'` → proceed to Phase 2.
-
-On anything else (no JSON, non-zero exit, connection refused), **auto-start Questa Lint**:
-
-1. Launch `qverify` in the background — it will source the Tcl CLI server script and start listening:
-
-   ```powershell
-   Start-Process -FilePath qverify -ArgumentList '-c','-do','tclserverw.tcl' -WindowStyle Hidden
-   ```
-
-   (Use the `Bash` tool's `run_in_background: true` if PowerShell's `Start-Process` is not preferred — never run `qverify` in the foreground, it does not return.)
-
-2. Poll `send-cli status` until it returns `ok`/`online`, up to ~30 seconds (e.g. retry every 2s for 15 attempts).
-
-3. If the server still does not come up, STOP and tell the user:
-
-   > Tried to auto-start Questa Lint with `qverify -c -do "tclserverw.tcl"` but the Tcl CLI server never came online. Check that `qverify` is on PATH and that `tclserverw.tc` exists in the current working directory, then re-run `/lint`.
-
-## Phase 2 — Output directory
-
-1. Create the host-side folder so we can read the report later:
-
-   ```powershell
-   New-Item -ItemType Directory -Force -Path $output_dir | Out-Null
-   ```
-
-2. Tell Questa about it:
-
-   ```powershell
-   $resp = send-cli "configure output directory $output_dir"
-   ```
-
-   Verify `$j.status -eq 'ok'`. On error, surface `$j.message` and abort — usually the path is not writable from Questa's CWD.
-
-## Phase 3 — Source discovery
-
-Precedence (stop at the first match — do not fall through):
-
-1. **Explicit filenames from the user** (from Phase 0 `explicit_sources`). If the user named one or more files (e.g. "please lint div.vhd"), use exactly that list. Do **not** look for `filelist.txt` and do **not** glob the CWD. Verify each file exists; if any is missing, abort with the missing path.
-2. If `filelist.txt` exists in CWD, read it. Skip blank lines and lines beginning with `#`. Each remaining line is a source path.
-3. Otherwise glob the CWD (non-recursive) for `*.vhd`, `*.vhdl`, `*.v`, `*.sv`.
-
-Print the resulting list back to the user with inferred language (vcom vs vlog) per file. If zero files are found, abort with: "No source files found in CWD and no filelist.txt present. Add files or create filelist.txt."
-
-When the source list came from case 1 and exactly one file was named, also echo the `top` derived from that file (see Phase 0) so the user can correct it before Phase 6.
-
-## Phase 4 — Per-file compile
-
-For each discovered source, dispatch by extension:
-
-| Extension       | Command                                  |
-|-----------------|-------------------------------------------|
-| `.vhd`, `.vhdl` | `send-cli "vcom -quiet -2008 <path>"`           |
-| `.v`, `.sv`     | `send-cli "vlog -quiet <path>"`           |
-
-Parse the JSON after each call. If `$j.status -eq 'error'` (or `$j.result` contains `** Error`), print the offending file and the message, then **STOP**. A failed compile invalidates the lint run.
-
-## Phase 5 — Methodology & goal
-
-```powershell
-$resp = send-cli "lint methodology $methodology -goal $goal"
-```
-
-Verify `$j.status -eq 'ok'`.
-
-## Phase 6 — Run lint
-
-```powershell
-$resp = send-cli "lint run -d $top"
-```
-
-Verify `$j.status -eq 'ok'`. Surface a one-line summary of `$j.result` to the user (e.g. the elapsed-time or rule-count line if Questa emits one).
-
-## Phase 7 — Generate report
-
-```powershell
-$resp = send-cli "lint generate report"
-```
-
-Verify `$j.status -eq 'ok'`.
-
-## Phase 8 — Summarize the report
-
-Read `$output_dir/lint.rpt`.
-
-- If missing, try the explicit form:
-
-  ```powershell
-  send-cli "lint generate report -file $output_dir/lint.rpt"
-  ```
-
-  If still missing, ask the user to check Questa's actual working directory — the report may have landed elsewhere if Questa's CWD differs from the shell CWD.
-
-- If present, emit ≤25 lines: total errors, total warnings, top-5 rule IDs by count, and the list of unique offending files. Offer to dump the full report or jump to Phase 9.
-
-## Phase 9 — Fix sources (only on explicit user request)
-
-Triggered when the user says things like "correct the source files", "fix the lint issues", "apply the report fixes".
-
-1. Re-read `$output_dir/lint.rpt`.
-2. Group findings by file. For each file, summarize rule + line + message.
-3. For each file, propose concrete edits using the Edit tool with exact before/after.
-4. **Wait for explicit user approval before each edit** (unless the user has said "apply all").
-5. After edits, suggest re-running `/lint` to confirm the design is clean.
-
-Never write to source files without confirmation.
+Run the phases below **in order**. Stop on the first hard failure and surface a clear remediation. Where a step says **decide**, resolve the value locally and send nothing; where it says **send**, issue a `send-cli` call — these are different actions.
 
 ---
 
-## send-cli quoting rules (Windows PowerShell)
+## Phase 0 — Configuration (resolve first, echo back)
 
-- Always wrap the Tcl command as one **double-quoted** argument: `send-cli "vcom -quiet $file"`. Single quotes would send a literal `$file` to Tcl.
-- Convert backslashes to forward slashes in paths before embedding (`$file = $file -replace '\\','/'`) — Tcl treats `\` as an escape inside `"..."`.
+From the user's message and `$ARGUMENTS`, **decide** the following table, then restate the resolved values as a short bullet list before doing anything else. Use the placeholders `<output_dir>`, `<methodology>`, `<goal>`, `<top>` in every command below — never bake an example value into a template.
+
+| Setting       | Source / how to resolve                                   | Default          |
+|---------------|-----------------------------------------------------------|------------------|
+| `output_dir`  | token after "output"/"out"/`--out=`                       | `./output_lint`  |
+| `methodology` | one of `fpga,ip,soc,standard`                             | `fpga`           |
+| `goal`        | one of `do-254,iso26262,start,simulation,implementation,release,release_xilinx,release_intel,release_microsemi,release_lattice` | `release` |
+| `top` (DUT)   | see Phase C — derived or asked, never guessed from a name | (must be known)  |
+| sources       | see Phase D                                               | (must be known)  |
+
+`top` and `sources` are resolved in their phases below; `output_dir`, `methodology`, and `goal` are resolved here.
+
+### Methodology / goal quick-reference
+
+Use this table to map user intent to the correct `methodology` and `goal` values:
+
+| User says                          | `methodology` | `goal`              | Tcl command sent in Phase F                                    |
+|------------------------------------|---------------|---------------------|----------------------------------------------------------------|
+| "lint according to do-254"         | `standard`    | `do-254`            | `lint methodology standard -goal do-254`                       |
+| "lint according to iso26262"       | `standard`    | `iso26262`          | `lint methodology standard -goal iso26262`                     |
+| "lint according to Xilinx rules"   | `fpga`        | `release_xilinx`    | `lint methodology fpga -goal release_xilinx`                   |
+| "lint according to Intel rules"    | `fpga`        | `release_intel`     | `lint methodology fpga -goal release_intel`                    |
+| "lint according to Microsemi rules"| `fpga`        | `release_microsemi` | `lint methodology fpga -goal release_microsemi`                |
+| "lint according to Lattice rules"  | `fpga`        | `release_lattice`   | `lint methodology fpga -goal release_lattice`                  |
+
+---
+
+## Phase A — Ensure the server is up
+
+1. **Send** `status`:
+
+   ```powershell
+   $resp = .\send-cli "status"
+   $j = $resp | ConvertFrom-Json
+   ```
+
+   On `$j.status -eq 'ok'` or `$j.status -eq 'online'` → go to Phase B.
+
+2. On no JSON, non-zero exit, or connection refused, **auto-start in the background** (the launcher does **not** return — it must not run in the foreground):
+
+   ```powershell
+   Start-Process -FilePath qverify -ArgumentList '-c','-do','scripts/tclserver.tcl' -WindowStyle Hidden 
+   ```
+
+   Use the **PowerShell tool** with `run_in_background: true`. Never run `qverify` in the foreground — it does not return.
+
+3. Poll `status` on a **bounded** loop: every ~2 s, up to ~10 attempts.
+
+4. If still down, STOP and tell the user what was tried and to verify `qverify` is on PATH and that `scripts/tclserver.tcl` exists:
+
+   > Tried to auto-start Questa Lint with `qverify -c -do "scripts/tclserver.tcl"` but the Tcl CLI server never came online. Check that `qverify` is on PATH and that `scripts/tclserver.tcl` exists in the current working directory, then re-run `/lint`.
+
+---
+
+## Phase B — Output directory
+
+1. Tell Questa: **send** `configure output directory <output_dir>`. Require `status==ok`; on error surface `.message` and abort (usual cause: path not writeable from Questa's CWD).
+
+---
+
+## Phase C — Determine the DUT / top
+
+Lint needs a top name (`-d <top>`) **in every path, including the `qrun.f` path** — do not skip this. Resolve `top` by this precedence, stopping at the first that applies:
+
+1. **User stated it explicitly** → use it.
+2. **Exactly one source file is in play** → read it and take the `entity <name> is` (VHDL) or `module <name>` (Verilog/SV) declaration. Do **not** infer from the filename stem.
+3. **Otherwise** use the `ParseRTL` helper to obtain the DUT name:
+
+   ```powershell
+   $du = (.\ParseRTL . -u) | ConvertFrom-Json    # -> {"dut":"div"}
+   ```
+
+   `ParseRTL` is invoked either as `ParseRTL` (on PATH) or as `.\ParseRTL`. The `.` is the current directory; `-u` returns the DUT name in JSON. If nothing is returned, **ask the user** for the DUT name.
+
+---
+
+## Phase D — Source discovery
+
+Precedence, stop at first match:
+
+1. **Explicit filenames** the user named → use exactly those; verify each exists; if any is missing, abort naming the missing path. Do not glob, do not read a file list.
+2. **`qrun.f`** in the project root → compile via qrun (Phase E, qrun path).
+3. **`fileList.txt`** in the root → each non-blank, non-`#` line is a source path.
+4. **Otherwise** use the `ParseRTL` helper to obtain the file list:
+
+   ```powershell
+   $fl = (.\ParseRTL . -f fileList.txt -u) | ConvertFrom-Json   # -> {"dut":"div"}
+   ```
+
+   `-f fileList.txt` writes the file list to the current directory and returns the DUT name in JSON. (This also yields a usable `dut` for Phase C if still unknown.)
+
+If zero sources are found, abort with a clear message.
+
+---
+
+## Phase E — Compile
+
+Issue the initial compile command based on the source path in use:
+
+- **qrun.f path:** **send** `qrun -compile -quiet -outdir . -f qrun.f`
+- **fileList.txt path:** **send** `qrun -compile -quiet -outdir . -f fileList.txt`
+
+After the compile command, run the following **two-gate check** (both must pass before advancing to Phase F):
+
+**Gate 1 — send-cli reply:** require `status==ok` and `.result` must not contain `** Error`. If either fails, print the message and **STOP**.
+
+**Gate 2 — `qrun.log` inspection:**
+
+```powershell
+if (Test-Path "qrun.log") {
+    $logLines = Get-Content "qrun.log"
+    $errorLines = $logLines | Where-Object { $_ -match '\*\* Error' }
+    if ($errorLines) {
+        # Check specifically for a missing-library error
+        $libError = $errorLines | Where-Object { $_ -match 'Library\s+"([^"]+)"\s+not found' }
+        if ($libError) {
+            # Extract the library name from the first such error
+            $libError[0] -match 'Library\s+"([^"]+)"\s+not found' | Out-Null
+            $missingLib = $Matches[1]
+            Write-Host "Missing library '$missingLib' detected — issuing vmap then retrying compile"
+            $vmapResp = .\send-cli "vmap $missingLib work"
+            $vmapJ = $vmapResp | ConvertFrom-Json
+            if ($vmapJ.status -ne 'ok') {
+                Write-Host "vmap failed: $($vmapJ.message)"
+                # STOP
+            }
+            # Retry compile (use whichever file-list form was used originally):
+            # qrun.f path:       $retryResp = .\send-cli "qrun -compile -quiet -outdir . -f qrun.f"
+            # fileList.txt path: $retryResp = .\send-cli "qrun -compile -quiet -outdir . -f fileList.txt"
+            # Then re-run both gates on the retry result; if the retry still fails, STOP.
+        } else {
+            # Non-library errors — report and stop
+            Write-Host "Compile errors found in qrun.log — lint cannot continue:"
+            $errorLines | ForEach-Object { Write-Host "  $_" }
+            # STOP — do not proceed to Phase F
+        }
+    }
+} else {
+    Write-Host "Warning: qrun.log not found in current directory — cannot verify compile output."
+}
+```
+
+**Missing-library retry rules:**
+- Extract the library name from the regex group `Library "([^"]+)" not found`.
+- **Send** `vmap <missingLib> work` then re-run the compile step.
+- Re-run **both gates** on the retry. If the retry still shows errors in `qrun.log`, **STOP** and report all remaining error lines — do not retry more than once per library.
+- Only the missing-library pattern triggers a retry. Any other `** Error` line stops the run immediately.
+
+---
+
+## Phase F — Apply methodology & goal
+
+**Send** `lint methodology <methodology> -goal <goal>` — require `status==ok`.
+
+---
+
+## Phase G — Run lint
+
+**Send** `lint run -d <top>` — require `status==ok`. Surface a one-line summary of `.result`. Common failure: unknown top → re-prompt for `<top>` (Phase C).
+
+---
+
+## Phase H — Generate & locate the report
+
+1. **Send** `lint generate report` — require `status==ok`.
+2. The report is written under `<output_dir>` as `lint.rpt` (a consequence of Phase B step 2).
+3. If `<output_dir>/lint.rpt` is missing, retry with an explicit path: **send** `lint generate report -file <output_dir>/lint.rpt`. If still missing, ask the user to check Questa's actual CWD (it may differ from the shell CWD).
+
+---
+
+## Phase I — Summarize for the user
+
+Read `<output_dir>/lint.rpt` and emit ≤25 lines: total errors, total warnings, top rule IDs by count, and the unique offending files. Flag errors prominently; a warnings-only run is still a successful run. Offer to dump the full report or proceed to fixes (Phase J).
+
+---
+
+## Phase J — Fix sources (only on explicit request)
+
+Triggered only by "correct/fix the sources", "apply the report fixes", etc.
+
+1. Re-read `<output_dir>/lint.rpt`; group findings by file (rule + line + message).
+2. Propose concrete edits with exact before/after.
+3. **Wait for user approval before editing** (unless told "apply all"). Never write to source files unprompted.
+4. After edits, suggest re-running the skill to confirm the design is clean.
+
+---
+
+## Shutdown
+
+Do **not** auto-exit the server by default — the user may want to re-lint after fixes or run again. Only **send** `exit` when the user asks to close Questa, or after confirming they are done.
+
+---
+
+## PowerShell / quoting rules (Windows, PS 5.1)
+
+**All commands in this skill run through the PowerShell tool exclusively.** Do not use Bash; Bash cannot parse Windows PowerShell syntax (`ConvertFrom-Json`, `Get-ChildItem`, `$variables`, etc.).
+
+- Wrap each Tcl command as one **double-quoted** argument: `send-cli "qrun -compile -quiet -f qrun.f"`. Single quotes would send a literal `$file` to Tcl.
+- Convert `\` → `/` in paths before embedding (`-replace '\\','/'`); Tcl escapes `\` inside `"..."`.
+- Capture stdout directly (`$resp = send-cli "..."`). Do **not** redirect `2>&1` — PS 5.1 wraps stderr as an ErrorRecord and flips `$?`, falsely signalling failure.
+- Do **not** chain with `&&`/`||` (parser error on PS 5.1). Sequence with `;` and explicit `if ($j.status -ne 'ok') { ... }` guards.
 - Reject paths containing spaces with a clear message rather than trying to escape them.
-- Capture stdout directly: `$resp = send-cli "..."`. Do NOT redirect `2>&1` — PowerShell 5.1 wraps stderr as an ErrorRecord and flips `$?`, falsely signalling failure.
-- Do NOT chain with `&&` / `||` (parser error on PS 5.1). Sequence with `;` and explicit `if ($j.status -ne 'ok') { ... }` guards.
-- Parse responses with `$j = $resp | ConvertFrom-Json`. Never grep the raw string.
+- **Variable followed by a colon in a string:** PS 5.1 treats `$var:` as a drive/scope prefix and raises a parse error. Always wrap the variable in `${}` or `$()`: use `"Attempt ${attempt}: ..."` or `"Attempt $($attempt): ..."`, never `"Attempt $attempt: ..."`. Apply this rule to every interpolated string where a variable is immediately followed by a literal colon.
+
+---
 
 ## Error-handling matrix
 
-| Condition                                       | Behaviour                                                                |
-|-------------------------------------------------|---------------------------------------------------------------------------|
-| `send-cli` non-zero exit / no JSON              | Treat as server down; print remediation from Phase 1; abort.              |
-| `configure output directory` returns error      | Abort; surface `$j.message`. Likely cause: path not writable from Questa. |
-| `vcom`/`vlog` returns error                     | Print file + message; abort the chain.                                    |
-| `lint run` returns error                        | Abort report; surface message. Common cause: unknown top-level — re-prompt. |
-| `lint.rpt` exists, warnings only                | Treat as success; summarize; offer Phase 9.                               |
-| `lint.rpt` exists, errors present               | Same flow but flag prominently.                                           |
-| `lint.rpt` missing after success                | Try the `-file` override; else ask user to check Questa's CWD.            |
+| Condition                                  | Behaviour                                              |
+|--------------------------------------------|--------------------------------------------------------|
+| `send-cli` non-zero exit / no JSON         | Treat as server down → Phase A remediation → abort.    |
+| `configure output directory` → error       | Abort; surface `.message` (likely not writeable).      |
+| compile → error / `** Error` in result     | Print file + message; abort the chain.                 |
+| `qrun.log` — missing library error         | Extract lib name; retry once proceding the compile command with `vmap <lib> work`; if retry still fails, abort. |
+| `qrun.log` — any other `** Error`          | Print each error line; abort — lint cannot continue.   |
+| `qrun.log` missing after compile           | Warn user; continue only if send-cli reply was clean.  |
+| `lint run` → error                         | Abort report; surface message; re-prompt for `<top>`.  |
+| `lint.rpt` present, warnings only          | Success; summarize; offer Phase J.                     |
+| `lint.rpt` present, errors                 | Same flow, flag prominently.                           |
+| `lint.rpt` missing after success           | Try `-file` override; else ask user to check Questa CWD.|
 
-## Setup (one-time)
+---
 
-To avoid a permission prompt on every `send-cli` call, add these entries to `permissions.allow` in `.claude/settings.local.json`:
+## One-time setup note
+
+To avoid a permission prompt on every call, suggest adding to `permissions.allow` in `.claude/settings.local.json`:
 
 ```json
-"PowerShell(send-cli *)",
-"Bash(send-cli *)",
+"PowerShell(.\send-cli *)",
+"PowerShell(.\ParseRTL *)",
 "PowerShell(New-Item -ItemType Directory -Force *)"
 ```
+
+**Note:** All commands in this skill run through the **PowerShell tool** only. Do not use Bash for this skill; Windows PowerShell syntax (ConvertFrom-Json, Get-ChildItem, Start-Process, etc.) will not parse in Bash.
